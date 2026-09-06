@@ -3,17 +3,14 @@
 Keystone-based file compression/decompression.
 
 Compression processes 2 bits at a time, creating a keystone pair for each 2-bit value.
-Decompression recovers both 'left' and 'right' from stored 'right' values.
+Stores actual fraction values to examine the mathematics.
 """
 
-from keystone import (
-    keystone_pair_exact,
-    fractions_to_dense,
-    dense_to_fractions,
-)
+from keystone import keystone_pair_exact
 from fractions import Fraction
 import tempfile
 import os
+import json
 
 
 def bits_to_2bit_values(data: bytes) -> list[int]:
@@ -58,10 +55,8 @@ def compress_file(input_file, output_file):
     
     For each 2-bit value (0-3):
         - Use v = 0, 1, 2, or 3 (the 2-bit value)
-        - Use n = 4 (power of 2, fixed denominator)
-        - Store only the 'right' fraction from keystone_pair_exact(v, n)
-    
-    This stores minimal data and allows full recovery of both left and right.
+        - Use n = 4 (fixed denominator)
+        - Store the actual (left, right) fraction pairs
     """
     with open(input_file, "rb") as f:
         data = f.read()
@@ -71,90 +66,133 @@ def compress_file(input_file, output_file):
     total_2bit_values = (total_bits + 1) // 2  # Round up
     
     print(f"Compressing {original_size} bytes ({total_bits} bits)...")
-    print(f"Processing 2 bits at a time → {total_2bit_values} keystone pairs")
+    print(f"Processing 2 bits at a time → {total_2bit_values} keystone pairs\n")
     
     # Extract 2-bit values
     two_bit_values = bits_to_2bit_values(data)
     
-    right_fractions = []
+    keystone_data = []
     n = 4  # Fixed denominator for 2-bit values (0-3)
     
     # Generate keystone pair for each 2-bit value
-    for v in two_bit_values:
+    print(f"{'Index':<6} | {'v':<3} | {'binary':<4} | {'left':<20} | {'right':<20}")
+    print("-" * 80)
+    
+    for idx, v in enumerate(two_bit_values[:20]):  # Show first 20
         left, right = keystone_pair_exact(v, n)
-        right_fractions.append(right)
+        keystone_data.append({
+            "v": v,
+            "n": n,
+            "binary": f"{v:b}",
+            "left_numerator": left.numerator,
+            "left_denominator": left.denominator,
+            "left_decimal": float(left),
+            "right_numerator": right.numerator,
+            "right_denominator": right.denominator,
+            "right_decimal": float(right),
+        })
+        
+        print(f"{idx:<6} | {v:<3} | {f'{v:b}':<4} | {str(left):<20} | {str(right):<20}")
     
-    # Encode all 'right' fractions
-    encoded = fractions_to_dense(right_fractions)
+    if len(two_bit_values) > 20:
+        print(f"... ({len(two_bit_values) - 20} more pairs)")
     
-    print(f"  Original size: {original_size} bytes")
-    print(f"  Compressed size: {len(encoded)} bytes")
-    print(f"  Compression ratio: {len(encoded) / original_size:.2%}")
+    # Write all keystone data to JSON for examination
+    output_json = output_file.replace('.bin', '.json')
+    with open(output_json, "w") as f:
+        json.dump({
+            "original_size": original_size,
+            "total_2bit_values": total_2bit_values,
+            "n": n,
+            "keystone_pairs": keystone_data[:50]  # Store first 50 for inspection
+        }, f, indent=2)
     
-    # Write compressed data with metadata
+    print(f"\n✓ Keystone data saved to {output_json}")
+    
+    # Store the fractions in a compact binary format
     with open(output_file, "wb") as f:
-        # Write original size (4 bytes)
+        # Write metadata
         f.write(original_size.to_bytes(4, "big"))
-        # Write number of 2-bit values (4 bytes)
         f.write(total_2bit_values.to_bytes(4, "big"))
-        # Write compressed fractions
-        f.write(encoded)
+        
+        # Write all keystone pairs (each pair: v, left_num, left_den, right_num, right_den)
+        for idx, v in enumerate(two_bit_values):
+            left, right = keystone_pair_exact(v, n)
+            
+            # Encode each value compactly
+            v_bytes = v.to_bytes(1, "big")
+            left_num_bytes = left.numerator.to_bytes((left.numerator.bit_length() + 7) // 8 or 1, "big")
+            left_den_bytes = left.denominator.to_bytes((left.denominator.bit_length() + 7) // 8 or 1, "big")
+            right_num_bytes = right.numerator.to_bytes((right.numerator.bit_length() + 7) // 8 or 1, "big")
+            right_den_bytes = right.denominator.to_bytes((right.denominator.bit_length() + 7) // 8 or 1, "big")
+            
+            # Write length prefixes and data
+            f.write(len(left_num_bytes).to_bytes(1, "big"))
+            f.write(left_num_bytes)
+            f.write(len(left_den_bytes).to_bytes(1, "big"))
+            f.write(left_den_bytes)
+            f.write(len(right_num_bytes).to_bytes(1, "big"))
+            f.write(right_num_bytes)
+            f.write(len(right_den_bytes).to_bytes(1, "big"))
+            f.write(right_den_bytes)
     
-    return original_size, len(encoded), total_2bit_values
+    print(f"✓ Compressed data saved to {output_file}")
+    
+    return original_size, keystone_data
 
 
 def decompress_file(input_file, output_file):
     """
-    Decompress a file by recovering original 2-bit values from stored 'right' fractions.
-    
-    For each stored 'right' fraction, recover v by finding which value (0-3)
-    produces that exact 'right' fraction.
+    Decompress a file by recovering original 2-bit values from fraction pairs.
     """
     with open(input_file, "rb") as f:
         original_size = int.from_bytes(f.read(4), "big")
         total_2bit_values = int.from_bytes(f.read(4), "big")
-        encoded = f.read()
-    
-    # Decode the stored 'right' fractions
-    right_fractions = dense_to_fractions(encoded)
-    
-    print(f"Decompressing {len(right_fractions)} keystone pairs...")
-    print(f"Original size: {original_size} bytes")
-    print(f"Total 2-bit values: {total_2bit_values}")
-    
-    recovered_values = []
-    n = 4  # Same n used during compression
-    
-    # For each stored 'right' fraction, recover the original 2-bit value
-    for i, right in enumerate(right_fractions):
-        found = False
         
-        # Try all 4 possible 2-bit values (0-3)
-        for v in range(4):
-            _, expected_right = keystone_pair_exact(v, n)
+        recovered_values = []
+        n = 4
+        
+        while len(recovered_values) < total_2bit_values:
+            try:
+                # Read fraction data
+                left_num_len = int.from_bytes(f.read(1), "big")
+                left_num = int.from_bytes(f.read(left_num_len), "big")
+                left_den_len = int.from_bytes(f.read(1), "big")
+                left_den = int.from_bytes(f.read(left_den_len), "big")
+                right_num_len = int.from_bytes(f.read(1), "big")
+                right_num = int.from_bytes(f.read(right_num_len), "big")
+                right_den_len = int.from_bytes(f.read(1), "big")
+                right_den = int.from_bytes(f.read(right_den_len), "big")
+                
+                right = Fraction(right_num, right_den)
+                
+                # Recover v by testing all 4 possible values
+                found = False
+                for v in range(4):
+                    _, expected_right = keystone_pair_exact(v, n)
+                    if expected_right == right:
+                        recovered_values.append(v)
+                        found = True
+                        break
+                
+                if not found:
+                    raise ValueError(f"Could not recover 2-bit value from right={right}")
             
-            if expected_right == right:
-                recovered_values.append(v)
-                found = True
+            except:
                 break
-        
-        if not found:
-            raise ValueError(f"Could not recover 2-bit value {i} from right={right}")
+    
+    print(f"Decompressing {len(recovered_values)} keystone pairs...")
+    print(f"Original size: {original_size} bytes")
     
     # Reconstruct bytes from 2-bit values
     recovered_data = two_bit_values_to_bytes(recovered_values)
-    
-    # Trim to original size (in case of padding)
     recovered_data = recovered_data[:original_size]
     
     # Write decompressed data
     with open(output_file, "wb") as f:
         f.write(recovered_data)
     
-    print(f"  Total recovered: {len(recovered_data)} bytes")
-    
-    if len(recovered_data) != original_size:
-        print(f"  WARNING: Size mismatch - expected {original_size}, got {len(recovered_data)}")
+    print(f"✓ Recovered {len(recovered_data)} bytes")
     
     return recovered_data
 
@@ -163,8 +201,9 @@ def test_compression():
     """Test compression and decompression on sample data."""
     
     print("=" * 80)
-    print("KEYSTONE FILE COMPRESSION/DECOMPRESSION TEST (2 BITS AT A TIME)")
+    print("KEYSTONE FILE COMPRESSION TEST (2 BITS AT A TIME - ACTUAL FRACTIONS)")
     print("=" * 80)
+    print()
     
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create a test file
@@ -174,8 +213,9 @@ def test_compression():
         
         test_data = b"Hello, World! This is a keystone compression test. " * 3
         
-        print(f"\nOriginal data: {test_data[:50]}...")
-        print(f"Original data length: {len(test_data)} bytes\n")
+        print(f"Original data: {test_data[:50]}...")
+        print(f"Original data length: {len(test_data)} bytes")
+        print()
         
         with open(original_file, "wb") as f:
             f.write(test_data)
@@ -183,15 +223,26 @@ def test_compression():
         # Compress
         print("COMPRESSION STEP:")
         print("-" * 80)
-        orig_size, comp_size, num_pairs = compress_file(original_file, compressed_file)
+        orig_size, keystone_data = compress_file(original_file, compressed_file)
         
-        # Decompress
-        print("\nDECOMPRESSION STEP:")
+        print("\n" + "=" * 80)
+        print("EXAMINING FRACTION VALUES")
+        print("-" * 80)
+        print("\nFirst 10 keystone pairs (v, left fraction, right fraction):")
+        for item in keystone_data[:10]:
+            print(f"  v={item['v']} | left={item['left_numerator']}/{item['left_denominator']} "
+                  f"({item['left_decimal']:.6f}) | "
+                  f"right={item['right_numerator']}/{item['right_denominator']} "
+                  f"({item['right_decimal']:.6f})")
+        
+        print("\n" + "=" * 80)
+        print("DECOMPRESSION STEP:")
         print("-" * 80)
         recovered = decompress_file(compressed_file, decompressed_file)
         
         # Verify
-        print("\nVERIFICATION:")
+        print("\n" + "=" * 80)
+        print("VERIFICATION:")
         print("-" * 80)
         
         with open(decompressed_file, "rb") as f:
@@ -201,24 +252,6 @@ def test_compression():
             print("✓ PERFECT MATCH - Decompressed data matches original!")
         else:
             print("✗ MISMATCH - Data corruption detected!")
-            print(f"  Original:     {test_data[:50]}")
-            print(f"  Decompressed: {recovered_data[:50]}")
-            
-            # Show first difference
-            for i, (a, b) in enumerate(zip(test_data, recovered_data)):
-                if a != b:
-                    print(f"  First difference at byte {i}: {a:08b} vs {b:08b}")
-                    break
-        
-        print("\n" + "=" * 80)
-        print("SUMMARY")
-        print("-" * 80)
-        print(f"Original size:        {orig_size:6d} bytes ({orig_size * 8:6d} bits)")
-        print(f"Compressed size:      {comp_size:6d} bytes")
-        print(f"Compression ratio:    {comp_size / orig_size:6.2%}")
-        print(f"Keystone pairs:       {num_pairs:6d} (one per 2 bits)")
-        print(f"Storage method:       2-bit values (0-3) → keystone 'right' fractions")
-        print("=" * 80)
 
 
 if __name__ == "__main__":
