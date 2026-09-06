@@ -2,8 +2,8 @@
 """
 Keystone-based file compression/decompression.
 
-Compression groups data into chunks and stores only the 'right' fraction.
-Decompression recovers both 'left' and 'right' from just 'right' using mathematical relationships.
+Compression processes 2 bits at a time, creating a keystone pair for each 2-bit value.
+Decompression recovers both 'left' and 'right' from stored 'right' values.
 """
 
 from keystone import (
@@ -16,23 +16,49 @@ import tempfile
 import os
 
 
-def bytes_to_int(data: bytes) -> int:
-    """Convert bytes to a single integer."""
-    return int.from_bytes(data, "big")
-
-
-def int_to_bytes(value: int, length: int) -> bytes:
-    """Convert integer to bytes with specified length."""
-    return value.to_bytes(length, "big")
-
-
-def compress_file(input_file, output_file, chunk_size=None):
+def bits_to_2bit_values(data: bytes) -> list[int]:
     """
-    Compress a file by treating entire content as one or more chunks.
+    Extract 2-bit values from data.
     
-    For each chunk of data:
-        - Treat the entire chunk as a single integer v
-        - Use n = 256 (or configurable)
+    Each 2 bits becomes a value 0-3.
+    Processes from MSB to LSB within each byte.
+    """
+    values = []
+    
+    for byte in data:
+        # Extract 2 bits at a time from MSB to LSB
+        for shift in [6, 4, 2, 0]:
+            two_bit_value = (byte >> shift) & 0b11
+            values.append(two_bit_value)
+    
+    return values
+
+
+def two_bit_values_to_bytes(values: list[int]) -> bytes:
+    """
+    Reconstruct bytes from 2-bit values.
+    
+    Each 4 values create one byte.
+    """
+    result = bytearray()
+    
+    # Process 4 values at a time
+    for i in range(0, len(values), 4):
+        byte = 0
+        for j in range(min(4, len(values) - i)):
+            byte |= (values[i + j] & 0b11) << (6 - j * 2)
+        result.append(byte)
+    
+    return bytes(result)
+
+
+def compress_file(input_file, output_file):
+    """
+    Compress a file by processing 2 bits at a time.
+    
+    For each 2-bit value (0-3):
+        - Use v = 0, 1, 2, or 3 (the 2-bit value)
+        - Use n = 4 (power of 2, fixed denominator)
         - Store only the 'right' fraction from keystone_pair_exact(v, n)
     
     This stores minimal data and allows full recovery of both left and right.
@@ -41,39 +67,26 @@ def compress_file(input_file, output_file, chunk_size=None):
         data = f.read()
     
     original_size = len(data)
+    total_bits = original_size * 8
+    total_2bit_values = (total_bits + 1) // 2  # Round up
     
-    # If no chunk size specified, use entire file as one chunk
-    if chunk_size is None:
-        chunk_size = original_size
+    print(f"Compressing {original_size} bytes ({total_bits} bits)...")
+    print(f"Processing 2 bits at a time → {total_2bit_values} keystone pairs")
     
-    print(f"Compressing {original_size} bytes...")
-    print(f"Chunk size: {chunk_size} bytes per keystone pair")
+    # Extract 2-bit values
+    two_bit_values = bits_to_2bit_values(data)
     
     right_fractions = []
-    n = 256  # Fixed denominator for all pairs
-    chunk_count = 0
+    n = 4  # Fixed denominator for 2-bit values (0-3)
     
-    # Process data in chunks
-    pos = 0
-    while pos < original_size:
-        # Get chunk
-        end = min(pos + chunk_size, original_size)
-        chunk = data[pos:end]
-        
-        # Convert chunk to integer v
-        v = bytes_to_int(chunk)
-        
-        # Generate keystone pair and keep only 'right' fraction
+    # Generate keystone pair for each 2-bit value
+    for v in two_bit_values:
         left, right = keystone_pair_exact(v, n)
         right_fractions.append(right)
-        chunk_count += 1
-        
-        pos = end
     
     # Encode all 'right' fractions
     encoded = fractions_to_dense(right_fractions)
     
-    print(f"  Chunks: {chunk_count}")
     print(f"  Original size: {original_size} bytes")
     print(f"  Compressed size: {len(encoded)} bytes")
     print(f"  Compression ratio: {len(encoded) / original_size:.2%}")
@@ -82,25 +95,24 @@ def compress_file(input_file, output_file, chunk_size=None):
     with open(output_file, "wb") as f:
         # Write original size (4 bytes)
         f.write(original_size.to_bytes(4, "big"))
-        # Write chunk size (4 bytes)
-        f.write(chunk_size.to_bytes(4, "big"))
+        # Write number of 2-bit values (4 bytes)
+        f.write(total_2bit_values.to_bytes(4, "big"))
         # Write compressed fractions
         f.write(encoded)
     
-    return original_size, len(encoded), chunk_count
+    return original_size, len(encoded), total_2bit_values
 
 
 def decompress_file(input_file, output_file):
     """
-    Decompress a file by recovering original bytes from stored 'right' fractions.
+    Decompress a file by recovering original 2-bit values from stored 'right' fractions.
     
-    Given: right = b/n + v, where b = int(binary(v) as decimal) and n = 256
-    
-    We solve for v by trying to reconstruct it from the 'right' value.
+    For each stored 'right' fraction, recover v by finding which value (0-3)
+    produces that exact 'right' fraction.
     """
     with open(input_file, "rb") as f:
         original_size = int.from_bytes(f.read(4), "big")
-        chunk_size = int.from_bytes(f.read(4), "big")
+        total_2bit_values = int.from_bytes(f.read(4), "big")
         encoded = f.read()
     
     # Decode the stored 'right' fractions
@@ -108,65 +120,36 @@ def decompress_file(input_file, output_file):
     
     print(f"Decompressing {len(right_fractions)} keystone pairs...")
     print(f"Original size: {original_size} bytes")
-    print(f"Chunk size: {chunk_size} bytes")
+    print(f"Total 2-bit values: {total_2bit_values}")
     
-    recovered_data = bytearray()
-    n = 256  # Same n used during compression
+    recovered_values = []
+    n = 4  # Same n used during compression
     
-    # For each stored 'right' fraction, recover the original chunk
+    # For each stored 'right' fraction, recover the original 2-bit value
     for i, right in enumerate(right_fractions):
         found = False
         
-        # Determine max value for this chunk
-        if i == len(right_fractions) - 1:
-            # Last chunk might be smaller
-            remaining = original_size - (i * chunk_size)
-            max_val = (1 << (remaining * 8)) - 1
-        else:
-            max_val = (1 << (chunk_size * 8)) - 1
-        
-        # Try to recover v from right value
-        # This is a brute force approach for small chunks
-        # For larger chunks, we'd need a more sophisticated method
-        
-        # Use binary search or mathematical solving
-        # For now, simple approach: iterate through possible values
-        
-        # Better approach: given right = b/n + v, solve algebraically
-        # right - v = b/n, where b = int(binary(v) as decimal)
-        # This is hard to solve directly, so we use an iterative approach
-        
-        # For reasonable chunk sizes, we can narrow the search
-        # Start with the integer part of right as an estimate
-        estimate = int(right)
-        
-        # Search around the estimate
-        search_range = max(1000, chunk_size * 10)
-        for v in range(max(0, estimate - search_range), estimate + search_range + 1):
-            if v > max_val:
-                break
-            
+        # Try all 4 possible 2-bit values (0-3)
+        for v in range(4):
             _, expected_right = keystone_pair_exact(v, n)
             
             if expected_right == right:
-                # Recover the chunk
-                chunk_len = len(right_fractions[-1:]) if i == len(right_fractions) - 1 else chunk_size
-                if i == len(right_fractions) - 1:
-                    chunk_len = original_size - (i * chunk_size)
-                
-                chunk_bytes = int_to_bytes(v, chunk_len)
-                recovered_data.extend(chunk_bytes)
+                recovered_values.append(v)
                 found = True
-                print(f"  ✓ Chunk {i}: recovered {len(chunk_bytes)} bytes")
                 break
         
         if not found:
-            print(f"  ✗ Chunk {i}: Could not recover from right={right}")
-            raise ValueError(f"Could not recover original chunk {i} from right={right}")
+            raise ValueError(f"Could not recover 2-bit value {i} from right={right}")
+    
+    # Reconstruct bytes from 2-bit values
+    recovered_data = two_bit_values_to_bytes(recovered_values)
+    
+    # Trim to original size (in case of padding)
+    recovered_data = recovered_data[:original_size]
     
     # Write decompressed data
     with open(output_file, "wb") as f:
-        f.write(bytes(recovered_data))
+        f.write(recovered_data)
     
     print(f"  Total recovered: {len(recovered_data)} bytes")
     
@@ -180,7 +163,7 @@ def test_compression():
     """Test compression and decompression on sample data."""
     
     print("=" * 80)
-    print("KEYSTONE FILE COMPRESSION/DECOMPRESSION TEST (ALL 153 BYTES)")
+    print("KEYSTONE FILE COMPRESSION/DECOMPRESSION TEST (2 BITS AT A TIME)")
     print("=" * 80)
     
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -197,10 +180,10 @@ def test_compression():
         with open(original_file, "wb") as f:
             f.write(test_data)
         
-        # Compress with full file as one chunk
+        # Compress
         print("COMPRESSION STEP:")
         print("-" * 80)
-        orig_size, comp_size, chunks = compress_file(original_file, compressed_file, chunk_size=len(test_data))
+        orig_size, comp_size, num_pairs = compress_file(original_file, compressed_file)
         
         # Decompress
         print("\nDECOMPRESSION STEP:")
@@ -220,14 +203,21 @@ def test_compression():
             print("✗ MISMATCH - Data corruption detected!")
             print(f"  Original:     {test_data[:50]}")
             print(f"  Decompressed: {recovered_data[:50]}")
+            
+            # Show first difference
+            for i, (a, b) in enumerate(zip(test_data, recovered_data)):
+                if a != b:
+                    print(f"  First difference at byte {i}: {a:08b} vs {b:08b}")
+                    break
         
         print("\n" + "=" * 80)
         print("SUMMARY")
         print("-" * 80)
-        print(f"Original size:     {orig_size:6d} bytes")
-        print(f"Compressed size:   {comp_size:6d} bytes")
-        print(f"Ratio:             {comp_size / orig_size:6.2%}")
-        print(f"Storage method:    All {orig_size} bytes as single keystone 'right' fraction")
+        print(f"Original size:        {orig_size:6d} bytes ({orig_size * 8:6d} bits)")
+        print(f"Compressed size:      {comp_size:6d} bytes")
+        print(f"Compression ratio:    {comp_size / orig_size:6.2%}")
+        print(f"Keystone pairs:       {num_pairs:6d} (one per 2 bits)")
+        print(f"Storage method:       2-bit values (0-3) → keystone 'right' fractions")
         print("=" * 80)
 
 
